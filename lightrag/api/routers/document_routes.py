@@ -75,6 +75,19 @@ class InsertTextsRequest(BaseModel):
     def strip_after(cls, doc_ids: list[str]) -> list[str]:
         return [doc_id.strip() for doc_id in doc_ids]
 
+
+class DeleteDocsRequest(BaseModel):
+    doc_ids: list[str] = Field(
+        min_length=1,
+        description="要删除的文档ID列表",
+    )
+
+    @field_validator("doc_ids", mode="after")
+    @classmethod
+    def strip_after(cls, doc_ids: list[str]) -> list[str]:
+        return [doc_id.strip() for doc_id in doc_ids]
+
+
 class InsertResponse(BaseModel):
     status: str = Field(description="Status of the operation")
     message: str = Field(description="Message describing the operation result")
@@ -759,6 +772,38 @@ def create_document_routes(
             return InsertResponse(status=status, message=status_message)
         except Exception as e:
             logger.error(f"Error /documents/batch: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.delete(
+        "/batch", response_model=InsertResponse, dependencies=[Depends(optional_api_key)]
+    )
+    async def delete_documents(request: DeleteDocsRequest):
+        """
+        Delete documents based on a list of document IDs.
+
+        This endpoint accepts a list of document IDs and deletes these documents and their
+        associated data (including text chunks, entities, and relationships).
+
+        Args:
+            request (DeleteDocsRequest): The request object containing the list of document IDs to delete
+
+        Returns:
+            InsertResponse: A response object containing the status and message.
+
+        Raises:
+            HTTPException: If an error occurs during the deletion process (500).
+        """
+        try:
+            for doc_id in request.doc_ids:
+                await rag.adelete_by_doc_id(doc_id)
+            
+            return InsertResponse(
+                status="success",
+                message=f"Successfully deleted {len(request.doc_ids)} documents"
+            )
+        except Exception as e:
+            logger.error(f"Error deleting documents: {str(e)}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
 
