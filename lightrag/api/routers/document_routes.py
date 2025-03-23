@@ -37,11 +37,22 @@ class InsertTextRequest(BaseModel):
         min_length=1,
         description="The text to insert",
     )
+    id: Optional[str] = Field(
+        default=None,
+        description="The document ID, if not provided, it will be automatically generated",
+    )
 
     @field_validator("text", mode="after")
     @classmethod
     def strip_after(cls, text: str) -> str:
         return text.strip()
+
+    @field_validator("id", mode="after")
+    @classmethod
+    def strip_after(cls, id: Optional[str]) -> Optional[str]:
+        if id is None:
+            return None
+        return id.strip()
 
 
 class InsertTextsRequest(BaseModel):
@@ -49,12 +60,20 @@ class InsertTextsRequest(BaseModel):
         min_length=1,
         description="The texts to insert",
     )
+    doc_ids: list[str] = Field(
+        default=[],
+        description="The document IDs, if not provided, it will be automatically generated",
+    )
 
     @field_validator("texts", mode="after")
     @classmethod
     def strip_after(cls, texts: list[str]) -> list[str]:
         return [text.strip() for text in texts]
-
+    
+    @field_validator("doc_ids", mode="after")
+    @classmethod
+    def strip_after(cls, doc_ids: list[str]) -> list[str]:
+        return [doc_id.strip() for doc_id in doc_ids]
 
 class InsertResponse(BaseModel):
     status: str = Field(description="Status of the operation")
@@ -429,16 +448,17 @@ async def pipeline_index_files(rag: LightRAG, file_paths: List[Path]):
         logger.error(traceback.format_exc())
 
 
-async def pipeline_index_texts(rag: LightRAG, texts: List[str]):
+async def pipeline_index_texts(rag: LightRAG, texts: List[str], doc_ids: list[str] | None = None):
     """Index a list of texts
 
     Args:
         rag: LightRAG instance
         texts: The texts to index
+        doc_ids: Optional document IDs for texts
     """
     if not texts:
         return
-    await rag.apipeline_enqueue_documents(texts)
+    await rag.apipeline_enqueue_documents(texts, doc_ids)
     await rag.apipeline_process_enqueue_documents()
 
 
@@ -590,7 +610,8 @@ def create_document_routes(
             HTTPException: If an error occurs during text processing (500).
         """
         try:
-            background_tasks.add_task(pipeline_index_texts, rag, [request.text])
+            doc_ids = [request.id] if request.id is not None else None
+            background_tasks.add_task(pipeline_index_texts, rag, [request.text], doc_ids)
             return InsertResponse(
                 status="success",
                 message="Text successfully received. Processing will continue in background.",
@@ -625,7 +646,7 @@ def create_document_routes(
             HTTPException: If an error occurs during text processing (500).
         """
         try:
-            background_tasks.add_task(pipeline_index_texts, rag, request.texts)
+            background_tasks.add_task(pipeline_index_texts, rag, request.texts, request.doc_ids)
             return InsertResponse(
                 status="success",
                 message="Text successfully received. Processing will continue in background.",
