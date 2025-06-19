@@ -1713,20 +1713,20 @@ class LightRAG:
             # 3. Before deleting, check the related entities and relationships for these chunks
             for chunk_id in chunk_ids:
                 # Check entities
-                entities_storage = await self.entities_vdb.client_storage
+                all_entities = await self.entities_vdb.get_all()
                 entities = [
                     dp
-                    for dp in entities_storage["data"]
-                    if chunk_id in dp.get("source_id")
+                    for dp in all_entities.values()
+                    if chunk_id in (dp.get("source_id") or "")
                 ]
                 logger.debug(f"Chunk {chunk_id} has {len(entities)} related entities")
 
                 # Check relationships
-                relationships_storage = await self.relationships_vdb.client_storage
+                all_relationships = await self.relationships_vdb.get_all()
                 relations = [
                     dp
-                    for dp in relationships_storage["data"]
-                    if chunk_id in dp.get("source_id")
+                    for dp in all_relationships.values()
+                    if chunk_id in (dp.get("source_id") or "")
                 ]
                 logger.debug(f"Chunk {chunk_id} has {len(relations)} related relations")
 
