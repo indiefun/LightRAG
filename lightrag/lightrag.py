@@ -1853,10 +1853,10 @@ class LightRAG:
 
             async def process_data(data_type, vdb, chunk_id):
                 # Check data (entities or relationships)
-                storage = await vdb.client_storage
+                all_data = await vdb.get_all()
                 data_with_chunk = [
                     dp
-                    for dp in storage["data"]
+                    for dp in all_data.values()
                     if chunk_id in (dp.get("source_id") or "").split(GRAPH_FIELD_SEP)
                 ]
 
