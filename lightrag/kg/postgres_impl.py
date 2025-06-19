@@ -876,6 +876,27 @@ class PGVectorStorage(BaseVectorStorage):
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
+    async def get_all(self) -> dict[str, Any]:
+        """Get all vector data from storage
+
+        Returns:
+            Dictionary containing all stored vector data
+        """
+        table_name = namespace_to_table_name(self.namespace)
+        if not table_name:
+            logger.error(f"Unknown namespace for get_all: {self.namespace}")
+            return {}
+
+        sql = f"SELECT * FROM {table_name} WHERE workspace=$1"
+        params = {"workspace": self.db.workspace}
+
+        try:
+            results = await self.db.query(sql, params, multirows=True)
+            return {row["id"]: row for row in results}
+        except Exception as e:
+            logger.error(f"Error retrieving all vector data from {self.namespace}: {e}")
+            return {}
+
 
 @final
 @dataclass
