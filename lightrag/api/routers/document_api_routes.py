@@ -2,7 +2,7 @@
 API routes for document batch insert and batch delete.
 """
 from typing import List, Optional
-from fastapi import APIRouter, BackgroundTasks, Depends, Body, HTTPException
+from fastapi import APIRouter, Depends, Body, HTTPException
 from pydantic import BaseModel, Field, field_validator
 from lightrag import LightRAG
 from lightrag.api.utils_api import get_combined_auth_dependency
@@ -10,7 +10,6 @@ from lightrag.utils import logger
 from .document_routes import InsertResponse, ClearDocumentsResponse
 import asyncio
 import json
-import threading
 import time
 import redis.asyncio as aioredis
 import os
