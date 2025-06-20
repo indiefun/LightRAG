@@ -1,15 +1,57 @@
 """
 API routes for document batch insert and batch delete.
 """
-from typing import List, Optional, Any
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Body
+from typing import List, Optional
+from fastapi import APIRouter, BackgroundTasks, Depends, Body, HTTPException
 from pydantic import BaseModel, Field, field_validator
 from lightrag import LightRAG
 from lightrag.api.utils_api import get_combined_auth_dependency
-from lightrag.base import DocStatus
+from lightrag.utils import logger
 from .document_routes import InsertResponse, ClearDocumentsResponse
-import traceback
-from ..config import global_args
+import asyncio
+import json
+import threading
+import time
+import redis.asyncio as aioredis
+import os
+
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+REDIS_DATABASE = int(os.getenv("REDIS_DATABASE", 0))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
+
+QUEUE_KEY = "pipeline_queue"
+STATUS_KEY = "pipeline_status"
+WORKER_LOCK_KEY = "pipeline_worker_lock"
+
+if REDIS_PASSWORD:
+    REDIS_URL = f"redis://:{REDIS_PASSWORD}@{REDIS_HOST}:{REDIS_PORT}/{REDIS_DATABASE}"
+else:
+    REDIS_URL = f"redis://{REDIS_HOST}:{REDIS_PORT}/{REDIS_DATABASE}"
+
+# 延迟初始化 Redis 连接
+redis_client = None
+worker_task = None
+
+def get_redis_client():
+    global redis_client
+    if redis_client is None:
+        try:
+            redis_client = aioredis.from_url(REDIS_URL)
+        except Exception as e:
+            logger.error(f"Failed to connect to Redis: {e}")
+            raise HTTPException(status_code=503, detail="Redis connection failed")
+    return redis_client
+
+async def check_redis_connection():
+    """检查 Redis 连接是否可用"""
+    try:
+        client = get_redis_client()
+        await client.ping()
+        return True
+    except Exception as e:
+        logger.error(f"Redis connection check failed: {e}")
+        return False
 
 router = APIRouter(
     prefix="/api/documents",
@@ -42,34 +84,146 @@ class BatchInsertRequest(BaseModel):
 class BatchDeleteRequest(BaseModel):
     ids: List[str] = Field(..., description="List of document IDs to delete")
 
+async def update_pipeline_status(status: str, message: str = ""):
+    try:
+        client = get_redis_client()
+        await client.hset(STATUS_KEY, mapping={"status": status, "message": message, "timestamp": str(time.time())})
+    except Exception as e:
+        logger.error(f"Failed to update pipeline status: {e}")
+
+async def pipeline_worker(rag: LightRAG):
+    client = get_redis_client()
+    await update_pipeline_status("idle", "Pipeline worker started")
+    while True:
+        try:
+            task = await client.blpop(QUEUE_KEY, timeout=5)
+            if not task:
+                await update_pipeline_status("idle", "No tasks in queue")
+                await asyncio.sleep(1)
+                continue
+            _, task_data = task
+            task_obj = json.loads(task_data)
+            await update_pipeline_status("busy", f"Processing {task_obj['type']} task")
+            
+            if task_obj["type"] == "insert":
+                await process_insert(rag, task_obj["data"])
+            elif task_obj["type"] == "delete":
+                await process_delete(rag, task_obj["data"])
+            else:
+                await update_pipeline_status("error", f"Unknown task type: {task_obj['type']}")
+                continue
+                
+            await update_pipeline_status("idle", f"Finished {task_obj['type']} task")
+        except Exception as e:
+            logger.error(f"Pipeline worker error: {e}")
+            await update_pipeline_status("error", f"Worker error: {str(e)}")
+            await asyncio.sleep(2)
+
+async def process_insert(rag: LightRAG, data):
+    # data: {"texts": [...], "sources": [...], "ids": [...]}
+    try:
+        texts = data.get("texts")
+        if not texts:
+            raise ValueError("texts is required")
+            
+        await rag.ainsert(
+            input=texts,
+            ids=data.get("ids"),
+            file_paths=data.get("sources"),
+        )
+    except Exception as e:
+        error_details = {
+            "task_type": "insert",
+            "task_data": data,
+            "error": str(e),
+            "error_type": type(e).__name__
+        }
+        logger.error(f"Insert task failed: {json.dumps(error_details, indent=2, ensure_ascii=False)}")
+        await update_pipeline_status("error", f"Insert error: {str(e)}")
+        raise  # 重新抛出异常，让上层处理
+
+async def process_delete(rag: LightRAG, data):
+    # data: {"ids": [...]}
+    try:
+        ids = data.get("ids")
+        if not ids:
+            raise ValueError("ids is required")
+            
+        for doc_id in ids:
+            await rag.adelete_by_doc_id(doc_id)
+    except Exception as e:
+        error_details = {
+            "task_type": "delete",
+            "task_data": data,
+            "error": str(e),
+            "error_type": type(e).__name__
+        }
+        logger.error(f"Delete task failed: {json.dumps(error_details, indent=2, ensure_ascii=False)}")
+        await update_pipeline_status("error", f"Delete error: {str(e)}")
+        raise  # 重新抛出异常，让上层处理
+
+async def ensure_worker(rag: LightRAG):
+    """使用 Redis 锁确保全局只有一个 worker 运行"""
+    global worker_task
+    
+    # 如果已经有 worker 任务在运行，直接返回
+    if worker_task and not worker_task.done():
+        return
+    
+    client = get_redis_client()
+    
+    # 尝试获取 worker 锁，超时时间 300 秒（5分钟）
+    lock_acquired = await client.set(WORKER_LOCK_KEY, "1", ex=300, nx=True)
+    
+    if lock_acquired:
+        # 成功获取锁，启动 worker
+        try:
+            worker_task = asyncio.create_task(pipeline_worker(rag))
+            await worker_task
+        except Exception as e:
+            logger.error(f"Worker task failed: {e}")
+        finally:
+            # 释放锁
+            try:
+                await client.delete(WORKER_LOCK_KEY)
+            except Exception as e:
+                logger.error(f"Failed to release worker lock: {e}")
+    else:
+        # 锁被其他进程持有，等待一下再检查
+        await asyncio.sleep(1)
+
 def create_document_api_routes(rag: LightRAG, api_key: Optional[str] = None):
     combined_auth = get_combined_auth_dependency(api_key)
 
     @router.post("", response_model=InsertResponse, dependencies=[Depends(combined_auth)])
     async def batch_insert_documents(
-        request: BatchInsertRequest, background_tasks: BackgroundTasks
+        request: BatchInsertRequest
     ):
         """
         批量插入文档。
         Body: { documents: [ {text, source, id}, ... ] }
         """
+        # 检查 Redis 连接
+        if not await check_redis_connection():
+            raise HTTPException(status_code=503, detail="Redis service unavailable")
+        
+        # 异步启动 worker（如果还没有运行）
+        asyncio.create_task(ensure_worker(rag))
+        
         try:
+            client = get_redis_client()
             texts = [doc.text for doc in request.documents]
             sources = [doc.source for doc in request.documents]
             ids = [doc.id for doc in request.documents]
-            async def do_insert():
-                await rag.apipeline_enqueue_documents(input=texts, file_paths=sources, ids=ids)
-                await rag.apipeline_process_enqueue_documents()
-            background_tasks.add_task(do_insert)
+            task = {"type": "insert", "data": {"texts": texts, "sources": sources, "ids": ids}}
+            await client.rpush(QUEUE_KEY, json.dumps(task))
             return InsertResponse(
                 status="success",
-                message="Text successfully received. Processing will continue in background.",
+                message="Text successfully enqueued. Processing will continue in background.",
             )
         except Exception as e:
-            import lightrag.utils as utils
-            utils.logger.error(f"Error /api/documents: {str(e)}")
-            utils.logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=str(e))
+            logger.error(f"Failed to enqueue insert task: {e}")
+            raise HTTPException(status_code=500, detail="Failed to enqueue task")
 
     @router.delete("", response_model=ClearDocumentsResponse, dependencies=[Depends(combined_auth)])
     async def batch_delete_documents(
@@ -79,77 +233,33 @@ def create_document_api_routes(rag: LightRAG, api_key: Optional[str] = None):
         批量删除指定ID的文档。
         Body: { ids: [id1, id2, ...] }
         """
-        from lightrag.kg.shared_storage import (
-            get_namespace_data,
-            get_pipeline_status_lock,
-        )
-        pipeline_status = await get_namespace_data("pipeline_status")
-        pipeline_status_lock = get_pipeline_status_lock()
-
-        async with pipeline_status_lock:
-            if pipeline_status.get("busy", False):
-                return ClearDocumentsResponse(
-                    status="busy",
-                    message="Cannot clear documents while pipeline is busy",
-                )
-            pipeline_status.update(
-                {
-                    "busy": True,
-                    "job_name": "Deleting Documents",
-                    "job_start": __import__('datetime').datetime.now().isoformat(),
-                    "docs": len(request.ids),
-                    "batchs": 1,
-                    "cur_batch": 0,
-                    "request_pending": False,
-                    "latest_message": "Starting document deletion process",
-                }
-            )
-            del pipeline_status["history_messages"][:]
-            pipeline_status["history_messages"].append(
-                f"Starting deletion of {len(request.ids)} documents"
-            )
-
+        # 检查 Redis 连接
+        if not await check_redis_connection():
+            raise HTTPException(status_code=503, detail="Redis service unavailable")
+        
+        # 异步启动 worker（如果还没有运行）
+        asyncio.create_task(ensure_worker(rag))
+        
         try:
-            deleted_count = 0
-            failed_count = 0
-            errors = []
-            for doc_id in request.ids:
-                try:
-                    await rag.adelete_by_doc_id(doc_id)
-                    deleted_count += 1
-                except Exception as e:
-                    failed_count += 1
-                    errors.append(f"{doc_id}: {str(e)}")
-            if "history_messages" in pipeline_status:
-                pipeline_status["history_messages"].append(
-                    f"Deleted {deleted_count} documents, failed to delete {failed_count}"
-                )
-            if failed_count == 0:
-                status = "success"
-                message = f"All {deleted_count} documents deleted successfully."
-            elif deleted_count > 0:
-                status = "partial_success"
-                message = f"Deleted {deleted_count} documents, failed to delete {failed_count}. Errors: {errors}"
-            else:
-                status = "fail"
-                message = f"Failed to delete any documents. Errors: {errors}"
-            if "history_messages" in pipeline_status:
-                pipeline_status["history_messages"].append(message)
-            return ClearDocumentsResponse(status=status, message=message)
+            client = get_redis_client()
+            task = {"type": "delete", "data": {"ids": request.ids}}
+            await client.rpush(QUEUE_KEY, json.dumps(task))
+            return ClearDocumentsResponse(
+                status="success",
+                message="Delete request enqueued. Processing will continue in background.",
+            )
         except Exception as e:
-            import lightrag.utils as utils
-            error_msg = f"Error deleting documents: {str(e)}"
-            utils.logger.error(error_msg)
-            utils.logger.error(traceback.format_exc())
-            if "history_messages" in pipeline_status:
-                pipeline_status["history_messages"].append(error_msg)
-            raise HTTPException(status_code=500, detail=str(e))
-        finally:
-            async with pipeline_status_lock:
-                pipeline_status["busy"] = False
-                completion_msg = "Document deletion process completed"
-                pipeline_status["latest_message"] = completion_msg
-                if "history_messages" in pipeline_status:
-                    pipeline_status["history_messages"].append(completion_msg)
+            logger.error(f"Failed to enqueue delete task: {e}")
+            raise HTTPException(status_code=500, detail="Failed to enqueue task")
+
+    @router.get("/pipeline_status")
+    async def get_pipeline_status():
+        try:
+            client = get_redis_client()
+            status = await client.hgetall(STATUS_KEY)
+            return status
+        except Exception as e:
+            logger.error(f"Failed to get pipeline status: {e}")
+            raise HTTPException(status_code=503, detail="Failed to get pipeline status")
 
     return router 
